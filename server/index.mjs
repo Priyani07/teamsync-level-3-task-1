@@ -1,0 +1,48 @@
+import { fileURLToPath } from 'node:url';
+import 'dotenv/config';
+import express from 'express';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import cookieParser from 'cookie-parser';
+import {createServer} from 'node:http';
+import {randomUUID} from 'node:crypto';
+import {existsSync} from 'node:fs';
+import {resolve} from 'node:path';
+import * as Y from 'yjs';
+import {createStore} from './store.mjs';
+import {opaque,digest,hashPassword,verifyPassword,validateCredentials,fail} from './security.mjs';
+import {attachRealtime} from './realtime.mjs';
+export async function createApp({store,origin=process.env.APP_ORIGIN||'http://localhost:3000',redisUrl=process.env.REDIS_URL}={}){
+ store ||= await createStore();
+ const app=express();const server=createServer(app);const production=process.env.NODE_ENV==='production';
+ app.disable('x-powered-by');app.use(helmet({contentSecurityPolicy:{directives:{defaultSrc:["'self'"],scriptSrc:["'self'"],styleSrc:["'self'","'unsafe-inline'"],connectSrc:["'self'",'ws:','wss:'],imgSrc:["'self'",'data:'],objectSrc:["'none'"],upgradeInsecureRequests:production?[]:null}}}));
+ app.use(express.json({limit:'32kb'}));app.use(cookieParser());
+ const origins=new Set([origin,...(!production?['http://localhost:5173','http://127.0.0.1:5173']:[])]);
+ app.use('/api',(req,res,next)=>{if(!['GET','HEAD','OPTIONS'].includes(req.method)&&!origins.has(req.get('origin')))return res.status(403).json({error:'Request origin not allowed.'});res.set('Cache-Control','no-store');next()});
+ const authLimit=rateLimit({windowMs:15*60*1000,limit:30,standardHeaders:'draft-8',legacyHeaders:false});
+ const sessionUser=async token=>store.one('SELECT u.id,u.name,u.email,s.expires FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires>?',[digest(token),Date.now()]);
+ app.use('/api',async(req,res,next)=>{req.user=await sessionUser(req.cookies.ts_session);next()});
+ const auth=(req,res,next)=>req.user?next():res.status(401).json({error:'Please sign in.'});
+ const membership=async(uid,wid)=>store.one('SELECT role FROM members WHERE user_id=? AND workspace_id=?',[uid,wid]);
+ const member=async(req,write=false)=>{const m=await membership(req.user.id,req.params.wid);if(!m)fail(403,'Workspace access denied.');if(write&&m.role==='viewer')fail(403,'This workspace is read-only.');return m};
+ const loginSession=async(req,res,user)=>{const token=opaque();await store.sql('INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)',[digest(token),user.id,Date.now()+7*86400000]);res.cookie('ts_session',token,{httpOnly:true,secure:production,sameSite:'strict',maxAge:7*86400000,path:'/'});res.json({id:user.id,name:user.name,email:user.email})};
+ app.post('/api/auth/register',authLimit,async(req,res)=>{validateCredentials(req.body,true);const email=req.body.email.trim().toLowerCase();if(await store.one('SELECT id FROM users WHERE email=?',[email]))fail(409,'Email already registered.');const user={id:randomUUID(),name:req.body.name.trim(),email};await store.sql('INSERT INTO users(id,email,name,password) VALUES(?,?,?,?)',[user.id,email,user.name,await hashPassword(req.body.password)]);await loginSession(req,res,user)});
+ app.post('/api/auth/login',authLimit,async(req,res)=>{validateCredentials(req.body);const user=await store.one('SELECT * FROM users WHERE email=?',[req.body.email.trim().toLowerCase()]);if(!user||!await verifyPassword(req.body.password,user.password))fail(401,'Email or password is incorrect.');await loginSession(req,res,user)});
+ app.get('/api/auth/me',auth,(req,res)=>res.json(req.user));
+ app.post('/api/auth/logout',auth,async(req,res)=>{await store.sql('DELETE FROM sessions WHERE token=?',[digest(req.cookies.ts_session)]);realtime.disconnectUserSession(digest(req.cookies.ts_session));res.clearCookie('ts_session',{path:'/'}).json({ok:true})});
+ app.get('/api/workspaces',auth,async(req,res)=>res.json(await store.sql('SELECT w.*,m.role FROM workspaces w JOIN members m ON m.workspace_id=w.id WHERE m.user_id=? ORDER BY w.created',[req.user.id])));
+ const label=(value,max=100)=>{if(typeof value!=='string'||!value.trim()||value.length>max)fail(400,'Please enter a valid title.');return value.trim()};
+ app.post('/api/workspaces',auth,async(req,res)=>{const id=randomUUID(),name=label(req.body.name);await store.sql('INSERT INTO workspaces(id,name,created) VALUES(?,?,?)',[id,name,Date.now()]);await store.sql('INSERT INTO members(workspace_id,user_id,role) VALUES(?,?,?)',[id,req.user.id,'owner']);res.status(201).json({id,name,role:'owner'})});
+ app.get('/api/workspaces/:wid/documents',auth,async(req,res)=>{await member(req);res.json(await store.sql('SELECT * FROM documents WHERE workspace_id=? ORDER BY created',[req.params.wid]))});
+ app.post('/api/workspaces/:wid/documents',auth,async(req,res)=>{await member(req,true);const id=randomUUID(),title=label(req.body.title),kind=req.body.kind==='board'?'board':'document';await store.sql('INSERT INTO documents(id,workspace_id,title,kind,created,updated) VALUES(?,?,?,?,?,?)',[id,req.params.wid,title,kind,Date.now(),Date.now()]);const doc=new Y.Doc();if(kind==='document')doc.getText('content').insert(0,'A little space for your next big idea.\n\nWrite together. Every change stays on this device and syncs when you reconnect.');else{const tasks=doc.getMap('tasks');for(const [title,status,tag] of [['Shape the project vision','todo','Strategy'],['Design the workspace','progress','Design'],['Set up the shared document','done','Engineering']]){const item=new Y.Map();item.set('title',title);item.set('status',status);item.set('tag',tag);tasks.set(randomUUID(),item)}}await store.appendUpdate(id,Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64'));doc.destroy();res.status(201).json({id,workspace_id:req.params.wid,title,kind})});
+ app.patch('/api/workspaces/:wid/documents/:did',auth,async(req,res)=>{await member(req,true);const doc=await store.one('SELECT id FROM documents WHERE id=? AND workspace_id=?',[req.params.did,req.params.wid]);if(!doc)fail(404,'Document not found.');const title=label(req.body.title);await store.sql('UPDATE documents SET title=?,updated=? WHERE id=?',[title,Date.now(),doc.id]);res.json({title})});
+ app.get('/api/workspaces/:wid/members',auth,async(req,res)=>{await member(req);res.json(await store.sql('SELECT u.id,u.name,u.email,m.role FROM users u JOIN members m ON m.user_id=u.id WHERE m.workspace_id=?',[req.params.wid]))});
+ app.post('/api/workspaces/:wid/invites',auth,async(req,res)=>{if((await member(req)).role!=='owner')fail(403,'Only owners can invite teammates.');const token=opaque(),role=req.body.role==='viewer'?'viewer':'editor';await store.sql('INSERT INTO invites(token,workspace_id,role,expires) VALUES(?,?,?,?)',[digest(token),req.params.wid,role,Date.now()+86400000]);res.json({token,role,expires:Date.now()+86400000})});
+ app.post('/api/invites/accept',auth,async(req,res)=>{const invite=await store.one('SELECT * FROM invites WHERE token=? AND expires>?',[digest(req.body.token),Date.now()]);if(!invite)fail(404,'This invite has expired or is invalid.');await store.sql('INSERT INTO members(workspace_id,user_id,role) VALUES(?,?,?) ON CONFLICT(workspace_id,user_id) DO NOTHING',[invite.workspace_id,req.user.id,invite.role]);res.json({workspace_id:invite.workspace_id})});
+ app.get('/api/health',async(req,res)=>{await store.one('SELECT 1 AS ok');res.json({ok:true,storage:process.env.DATABASE_URL?'postgres':'sqlite',realtime:realtime.health()})});
+ const realtime=await attachRealtime({server,store,sessionUser,membership,origins,redisUrl});
+ if(existsSync('dist')){app.use(express.static('dist'));app.get('/{*path}',(req,res)=>res.sendFile(resolve('dist/index.html')))};
+ app.use((err,req,res,next)=>{if(!err.status)console.error('Request failed:',err.message);res.status(err.status||500).json({error:err.status?err.message:'Something went wrong. Please try again.'})});
+ return {app,server,store,realtime,close:async()=>{await realtime.close();await new Promise(r=>server.close(r));await store.close()}};
+}
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {const instance=await createApp();instance.server.listen(Number(process.env.PORT||3000),'0.0.0.0',()=>console.log('TeamSync listening on port '+(process.env.PORT||3000)));for(const sig of ['SIGINT','SIGTERM'])process.on(sig,async()=>{await instance.close();process.exit(0)})}

@@ -1,0 +1,33 @@
+{
+  "name": "teamsync",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "vite build && node scripts/precache.mjs",
+    "start": "node server/index.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check server/index.mjs && node --check server/store.mjs && node --check server/realtime.mjs && node --check src/main.js",
+    "setup": "node scripts/setup.mjs"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "helmet": "^8.1.0",
+    "cookie-parser": "^1.4.7",
+    "ws": "^8.18.3",
+    "yjs": "^13.6.27",
+    "y-indexeddb": "^9.0.12",
+    "pg": "^8.16.3",
+    "redis": "^5.8.2",
+    "dotenv": "^17.2.2",
+    "lucide": "^0.468.0"
+  },
+  "devDependencies": {
+    "vite": "^7.1.5"
+  }
+}
